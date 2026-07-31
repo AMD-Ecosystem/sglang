@@ -5,6 +5,22 @@ python3 -m unittest test_flashinfer_rocm_attention_backend.TestFlashInferRocmAtt
 
 AMD-only: the backend is registered under is_hip() and needs the amd-flashinfer
 wheel, so there is no register_cuda_ci here.
+
+The model can be overridden with SGLANG_TEST_ATTENTION_MODEL, which matters for
+two reasons: the default is a gated repo, and this backend refuses GQA group
+sizes outside 1/2/3/4/8. Any substitute must keep the default's attention shape
+or the run says nothing useful -- Mistral-7B-Instruct-v0.3 (32/8, group 4)
+matches Llama-3.1-8B exactly.
+
+Set SGLANG_TEST_ATTENTION_MMLU_THRESHOLD too. The default pass mark only holds
+for the default model; the harness scores an answer solely when the model emits
+"Answer: X", so a model with other formatting habits scores near the 4-choice
+floor while being entirely correct. Verified locally:
+
+    SGLANG_TEST_ATTENTION_MODEL=mistralai/Mistral-7B-Instruct-v0.3 \
+    SGLANG_TEST_ATTENTION_MMLU_THRESHOLD=0.28 \
+    python3 -m unittest \
+      registered.attention.test_flashinfer_rocm_attention_backend.TestFlashInferRocmAttnBackend
 """
 
 import unittest
@@ -12,6 +28,7 @@ from types import SimpleNamespace
 
 import requests
 
+from sglang.srt.environ import envs
 from sglang.srt.utils import is_flashinfer_rocm_available, kill_process_tree
 from sglang.test.ci.ci_register import register_amd_ci
 from sglang.test.run_eval import run_eval
@@ -24,6 +41,15 @@ from sglang.test.test_utils import (
 )
 
 register_amd_ci(est_time=1800, suite="stage-b-test-1-gpu-small-amd")
+
+
+def _model_under_test() -> str:
+    return envs.SGLANG_TEST_ATTENTION_MODEL.get() or DEFAULT_MODEL_NAME_FOR_TEST
+
+
+def _mmlu_threshold(default: float) -> float:
+    override = envs.SGLANG_TEST_ATTENTION_MMLU_THRESHOLD.get()
+    return default if override is None else override
 
 # Prompts chosen to span the two paths that broke during bring-up: a long-ish
 # prompt exercises causal paged prefill over many rows, short ones exercise the
@@ -62,11 +88,13 @@ def _greedy_completions(base_url: str) -> list[str]:
     "requires the amd-flashinfer package on a ROCm GPU",
 )
 class TestFlashInferRocmAttnBackend(CustomTestCase):
-    model = DEFAULT_MODEL_NAME_FOR_TEST
     base_url = DEFAULT_URL_FOR_TEST
+    # Tied to DEFAULT_MODEL_NAME_FOR_TEST; override alongside the model.
+    mmlu_score_threshold = 0.65
 
     @classmethod
     def setUpClass(cls):
+        cls.model = _model_under_test()
         cls.process = popen_launch_server(
             cls.model,
             cls.base_url,
@@ -89,7 +117,15 @@ class TestFlashInferRocmAttnBackend(CustomTestCase):
                 num_threads=32,
             )
         )
-        self.assertGreaterEqual(metrics["score"], 0.65)
+        threshold = _mmlu_threshold(self.mmlu_score_threshold)
+        self.assertGreaterEqual(
+            metrics["score"],
+            threshold,
+            f"MMLU {metrics['score']:.3f} < {threshold} on {self.model}. If this "
+            f"is a substituted model, check the score against another backend "
+            f"before suspecting attention -- the default threshold is calibrated "
+            f"for {DEFAULT_MODEL_NAME_FOR_TEST} and does not transfer.",
+        )
 
 
 @unittest.skipUnless(
@@ -105,8 +141,11 @@ class TestFlashInferRocmMatchesAiter(CustomTestCase):
     already trusts on this hardware is what actually catches it.
     """
 
-    model = DEFAULT_MODEL_NAME_FOR_TEST
     base_url = DEFAULT_URL_FOR_TEST
+
+    @classmethod
+    def setUpClass(cls):
+        cls.model = _model_under_test()
 
     @classmethod
     def _collect(cls, backend: str) -> list[str]:

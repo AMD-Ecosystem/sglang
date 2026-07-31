@@ -656,6 +656,20 @@ class Envs:
     SGLANG_FLASHINFER_USE_PAGED = EnvBool(False)
     # Default to the pick from flashinfer
     SGLANG_FLASHINFER_WORKSPACE_SIZE = EnvInt(384 * 1024 * 1024)
+    # Override the model an attention-backend test launches. Unset means the
+    # suite default. Exists because attention backends have hard model
+    # constraints (flashinfer_rocm rejects GQA group sizes outside 1/2/3/4/8),
+    # and because the default is a gated repo -- so a test pinned to one model
+    # cannot run on a dev box without that access.
+    SGLANG_TEST_ATTENTION_MODEL = EnvStr(None)
+    # MMLU pass mark to use with SGLANG_TEST_ATTENTION_MODEL. Required whenever
+    # the model is overridden: the committed default is calibrated for
+    # Llama-3.1-8B, and the harness scores an answer only when the model emits
+    # "Answer: X", so a model with different formatting habits scores far lower
+    # while being perfectly correct. Measured example: on Mistral-7B-Instruct-v0.3
+    # both flashinfer_rocm (0.344) and aiter (0.313) land near the 4-choice
+    # floor, so the default 0.65 says nothing about either backend.
+    SGLANG_TEST_ATTENTION_MMLU_THRESHOLD = EnvFloat(None)
     # Kernel family the ROCm flashinfer port dispatches to: "fa2" (in-tree HIP),
     # "aiter" (AITER), or "auto" (AITER when compatible, else fa2). Defaults to
     # "fa2": "auto" would make an aiter-vs-flashinfer_rocm benchmark compare
