@@ -32,10 +32,59 @@ Select the kernel family behind `flashinfer_rocm` with
 | torch | 2.9.1+rocm7.2.0 |
 | FlashInfer | 0.5.3+amd.2.dev52 (AMD-Ecosystem/flashinfer @ `cd6b40d2`) |
 | AITER | ROCm/aiter @ `d9e5ef7c` (SGLang's `AITER_COMMIT_DEFAULT`) |
-| Model | TinyLlama-1.1B-Chat-v1.0 (32 Q heads / 4 KV heads → GQA group 8) |
+| Models | Mistral-7B-Instruct-v0.3 (32/8 → GQA group 4, the Llama-3.1-8B shape); TinyLlama-1.1B-Chat-v1.0 (32/4 → group 8) |
 | Date | 2026-07-31 |
 
-## Results
+`meta-llama/*` is gated for this account, so Mistral-7B stands in for
+Llama-3.1-8B; its attention shape is identical.
+
+## Results — Mistral-7B-Instruct-v0.3 (production-shaped)
+
+The headline numbers. 32/8 heads → GQA group 4, `head_dim=128`, bf16, no sliding
+window — the same attention shape as Llama-3.1-8B, which is gated. Batch 1/8/32,
+input 512, output 32, CUDA graphs on for both.
+
+| Batch | Phase | `flashinfer_rocm` (fa2) | `aiter` | ratio |
+| ---: | --- | ---: | ---: | ---: |
+| 1 | prefill | 23,018 | 24,354 | 0.95 |
+| 1 | decode | 151 | 170 | 0.89 |
+| 8 | prefill | 34,346 | 36,709 | 0.94 |
+| 8 | decode | 1,136 | 1,267 | 0.90 |
+| 32 | prefill | 34,841 | 38,687 | 0.90 |
+| 32 | decode | 3,934 | 4,228 | 0.93 |
+
+At production scale `flashinfer_rocm` lands within **5–10% on prefill and
+7–11% on decode**. The 1.1B numbers further down look far worse (0.78 decode);
+that difference is itself the evidence for where the cost is.
+
+### The gap is fixed per-step overhead
+
+Decode gap in absolute terms, both models:
+
+| Batch | TinyLlama-1.1B | Mistral-7B |
+| ---: | ---: | ---: |
+| 1 | 0.49 ms | 0.74 ms |
+| 8 | 0.55 ms | 0.72 ms |
+| 32 | 0.57 ms | 0.56 ms |
+
+Roughly **0.6 ms regardless of model size or batch size** — 6× the parameters
+and 32× the batch, same absolute cost. The *ratio* improves from 0.78 to ~0.90
+purely because each step does more work for the fixed cost to hide behind.
+
+That is what a fixed per-step overhead predicts. A per-token kernel deficit
+would scale with batch and with model size, and would leave the ratio flat
+instead of the absolute gap flat.
+
+The overhead is the plan path. This backend calls the public ROCm `plan()` on
+every decode step; SGLang's NVIDIA FlashInfer backend uses `fast_decode_plan`
+specifically to skip the device-to-host copies inside `plan()`, and the ROCm
+port exports no equivalent. **Making the plan path sync-free is the whole
+optimization**, and it is worth about 0.6 ms/step wherever it lands.
+
+Eager mode corroborates this: with the graph path removed, the in-tree HIP
+kernel is *ahead* of AITER on decode (see the TinyLlama eager table below).
+
+## Results — TinyLlama-1.1B (bring-up)
 
 Throughput, tokens/s (higher is better):
 
@@ -56,23 +105,12 @@ Median decode latency, seconds (lower is better):
 | 8 | 0.00246 | 0.00191 |
 | 32 | 0.00268 | 0.00211 |
 
-### Where the decode gap actually is
+Median decode latency here is 2.34 / 2.46 / 2.68 ms against AITER's
+1.85 / 1.91 / 2.11 ms — the ~0.5 ms flat gap analysed above.
 
-AITER leads on every graph-enabled row, but the shape of the decode gap says it
-is **not** the kernel:
-
-| Batch | `flashinfer_rocm` (ms) | `aiter` (ms) | absolute gap (ms) |
-| ---: | ---: | ---: | ---: |
-| 1 | 2.34 | 1.85 | 0.49 |
-| 8 | 2.46 | 1.91 | 0.55 |
-| 32 | 2.68 | 2.11 | 0.57 |
-
-The gap is ~0.5 ms and essentially flat from batch 1 to batch 32 — 32× the work
-for the same extra cost. That is fixed per-step overhead, not per-token kernel
-cost, which would scale with the batch.
-
-Eager mode (graphs off, batch 8, same shapes) confirms it — with the graph path
-removed, the in-tree HIP kernel is *ahead* of AITER on decode:
+Eager mode (graphs off, batch 8, same shapes) is the other half of the evidence:
+with the graph path removed, the in-tree HIP kernel is *ahead* of AITER on
+decode, which rules out the kernel as the cause.
 
 | Config | prefill tok/s | decode tok/s |
 | --- | ---: | ---: |
@@ -155,8 +193,41 @@ ROCm port, which is an upstream change.
 
 ## Correctness
 
-Greedy decoding (`temperature=0`, 48 new tokens) over 4 prompts, CUDA graphs on
-for both: **4/4 outputs byte-identical between `flashinfer_rocm` and `aiter`.**
+Greedy decoding (`temperature=0`, 48 new tokens), CUDA graphs on for both:
+
+| Model | Identical outputs |
+| --- | --- |
+| TinyLlama-1.1B | 4/4 |
+| Mistral-7B-Instruct-v0.3 | 3/4 |
+
+The one Mistral divergence is a **tie-break, not a wrong result**, and it is
+worth understanding before treating exact-match as the bar.
+
+Both completions were correct; they just worded the answer differently. Running
+the same prompt with per-token logprobs locates the split at output token 7,
+where the two candidates are:
+
+| Backend | top-1 | top-2 | margin |
+| --- | --- | --- | ---: |
+| `aiter` | tok 1070 @ -2.19410 | tok 12928 @ -2.19410 | **0.00000** |
+| `flashinfer_rocm` | tok 12928 @ -2.18112 | tok 1070 @ -2.24362 | 0.06250 |
+
+Same two candidate tokens, and under `aiter` they are **exactly tied** to the
+last bit. Which one greedy picks is decided by tie-break order, not by attention
+math. Logprob agreement over the preceding 7 tokens is within 0.030, and the
+top-5 distribution for the first token matches in both membership and order
+(largest disagreement 0.063 logprob).
+
+Once greedy takes different tokens at position 7, the sequences separate
+completely — so a single tie flips the whole rest of the output. This is why
+`test_flashinfer_rocm_attention_backend.py` reports every mismatched prompt with
+both texts rather than asserting on the first: **exact match across kernels is
+not a sound correctness bar**, and a failure there needs this same logprob check
+before it means anything.
+
+Kernel-level agreement is the load-bearing check instead: causal paged prefill,
+non-causal prefill, and decode each match a torch SDPA reference to <0.01 in
+`test/registered/kernels/test_flashinfer_rocm_attention_kernels.py`.
 
 Kernel-level checks live in
 `test/registered/kernels/test_flashinfer_rocm_attention_kernels.py`; end-to-end
