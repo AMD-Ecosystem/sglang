@@ -75,14 +75,45 @@ That is what a fixed per-step overhead predicts. A per-token kernel deficit
 would scale with batch and with model size, and would leave the ratio flat
 instead of the absolute gap flat.
 
-The overhead is the plan path. This backend calls the public ROCm `plan()` on
-every decode step; SGLang's NVIDIA FlashInfer backend uses `fast_decode_plan`
-specifically to skip the device-to-host copies inside `plan()`, and the ROCm
-port exports no equivalent. **Making the plan path sync-free is the whole
-optimization**, and it is worth about 0.6 ms/step wherever it lands.
+### Attributing the gap — measured, not inferred
 
-Eager mode corroborates this: with the graph path removed, the in-tree HIP
-kernel is *ahead* of AITER on decode (see the TinyLlama eager table below).
+An earlier revision of this file blamed the plan path outright. That was wrong,
+and worth recording because the reasoning was superficially sound: SGLang's
+NVIDIA backend carries a `fast_decode_plan` to dodge device-to-host copies
+inside `plan()`, the ROCm port exports no equivalent, and the gap had the right
+shape. Direct measurement says otherwise.
+
+Timing the pieces at batch 8 on TinyLlama (22 layers), where the step gap is
+0.50 ms:
+
+| Component | `flashinfer_rocm` | `aiter` | gap | share |
+| --- | ---: | ---: | ---: | ---: |
+| `init_forward_metadata_out_graph` (per step) | 0.190 ms | 0.080 ms | 0.109 ms | **22%** |
+| everything else (attention kernels) | — | — | ~0.39 ms | **78%** |
+
+And within that metadata figure, the D2H sync is minor: a whole `plan()` call
+costs 0.070 ms, dropping to 0.029 ms when handed CPU-resident inputs, so the
+sync is worth **0.039 ms** — about 8% of the step gap, not the whole of it.
+
+The remaining ~0.39 ms is the decode kernel. `fa2` decode `run()` measures
+0.0405 ms/call at these shapes, i.e. 0.891 ms/step across 22 layers; closing
+0.39 ms would require AITER's kernel to be about **1.78x faster per call**.
+That is an unremarkable margin between a hand-tuned CDNA3 assembly/CK kernel
+and a HIP port of a CUDA kernel.
+
+**Correction to the eager result below:** eager mode showing `fa2` ahead of
+AITER does *not* clear the kernel. Eager pays large per-layer Python and launch
+overhead on both sides, which swamps a 0.02 ms/call kernel difference. Only the
+graph-captured measurement isolates kernel time, and it puts AITER ahead.
+
+So the optimization splits, and the larger half is not in SGLang:
+
+1. **~0.39 ms/step — kernel work in the ROCm fork.** Out of scope here; belongs
+   with the FlashInfer HIP decode kernel.
+2. **~0.11 ms/step — metadata prep in this backend.** Addressable: pass
+   CPU-resident `indptr` / `last_page_len` / `seq_lens` into `plan()` (worth
+   0.039 ms), and cut the cost of building kv-indices, where AITER's equivalent
+   is 2.4x cheaper.
 
 ## Results — TinyLlama-1.1B (bring-up)
 
