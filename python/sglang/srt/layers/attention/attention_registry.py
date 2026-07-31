@@ -108,6 +108,28 @@ def create_wave_backend(runner):
     return WaveAttnBackend(runner)
 
 
+@register_attention_backend("flashinfer_rocm")
+def create_flashinfer_rocm_backend(runner):
+    if not _is_hip:
+        raise ValueError(
+            "The flashinfer_rocm attention backend requires an AMD ROCm GPU. "
+            "On NVIDIA, use --attention-backend flashinfer instead."
+        )
+
+    if runner.use_mla_backend:
+        from sglang.srt.layers.attention.flashinfer_rocm_backend import (
+            FlashInferRocmMlaAttnBackend,
+        )
+
+        return FlashInferRocmMlaAttnBackend(runner)
+
+    from sglang.srt.layers.attention.flashinfer_rocm_backend import (
+        FlashInferRocmAttnBackend,
+    )
+
+    return FlashInferRocmAttnBackend(runner)
+
+
 @register_attention_backend("ascend")
 def create_ascend_backend(runner):
     from sglang.srt.hardware_backend.npu.attention.ascend_backend import (

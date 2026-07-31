@@ -153,6 +153,16 @@ The support matrix is split into two parts: MHA (standard attention) and MLA (mu
       <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.05)"}}>❌</td>
     </tr>
     <tr>
+      <td style={{padding: "9px 12px", fontWeight: 500, backgroundColor: "rgba(255,255,255,0.02)"}}>**FlashInfer (ROCm)**</td>
+      <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.05)"}}>❌</td>
+      <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.02)"}}>❌</td>
+      <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.05)"}}>❌</td>
+      <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.02)"}}>❌</td>
+      <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.05)"}}>❌</td>
+      <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.02)"}}>❌</td>
+      <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.05)"}}>❌</td>
+    </tr>
+    <tr>
       <td style={{padding: "9px 12px", fontWeight: 500, backgroundColor: "rgba(255,255,255,0.02)"}}>**Ascend (NPU)**</td>
       <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.05)"}}>✅</td>
       <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.02)"}}>❌</td>
@@ -693,6 +703,48 @@ python3 -m sglang.launch_server \
   --model meta-llama/Meta-Llama-3.1-8B-Instruct \
   --attention-backend wave
 ```
+
+- FlashInfer (ROCm)
+```bash Command
+python3 -m sglang.launch_server \
+  --model meta-llama/Meta-Llama-3.1-8B-Instruct \
+  --attention-backend flashinfer_rocm \
+  --page-size 1
+```
+
+Requires the `amd-flashinfer` package (the AMD-Ecosystem/flashinfer ROCm port)
+on gfx942 / gfx950, built from `0.5.3+amd.2` or newer — earlier releases compute
+causal prefill incorrectly on gfx942 and do not ship MLA. See
+`docker/rocm-flashinfer.Dockerfile` and `docker/rocm-flashinfer-smoke.py`.
+
+Current limits: `--page-size 1` only; no sliding window, cross-attention,
+multi-item scoring, or speculative decoding (each raises rather than silently
+degrading); decode CUDA graphs only (prefill graphs are auto-disabled). The GQA
+group size must be one of 1, 2, 3, 4, 8 — the ROCm decode kernel instantiates no
+others, so e.g. Qwen2.5-0.5B (14/2 = 7) is rejected at startup.
+
+MLA (DeepSeek) is **decode-only**. Prefill at `head_dim_qk=192` /
+`head_dim_vo=128` is unsupported on both ROCm paths — `fa2` fails to compile for
+that shape and AITER rejects unequal Q/KV head dims — so run it hybrid:
+
+```bash Command
+python3 -m sglang.launch_server \
+  --model deepseek-ai/DeepSeek-V2-Lite --trust-remote-code \
+  --prefill-attention-backend aiter \
+  --decode-attention-backend flashinfer_rocm \
+  --page-size 1
+```
+
+MLA decode is bf16-only, eager-only (the ROCm `BatchMLAPagedAttentionWrapper`
+has no CUDA-graph support), and routes to AITER since the port ships no HIP MLA
+kernel. Losing graph capture costs roughly 9× on decode, so this configuration
+is currently for validation, not production — see
+`benchmark/flashinfer_rocm/README.md`.
+
+Select the underlying kernel family with `SGLANG_FLASHINFER_ROCM_BACKEND`
+(`fa2` default, `aiter`, or `auto`). It defaults to the in-tree HIP `fa2` kernel
+so that a comparison against `--attention-backend aiter` is not AITER against
+itself, and because `auto` silently ignores kwargs AITER cannot honor.
 
 - FlexAttention
 ```bash Command

@@ -656,6 +656,11 @@ class Envs:
     SGLANG_FLASHINFER_USE_PAGED = EnvBool(False)
     # Default to the pick from flashinfer
     SGLANG_FLASHINFER_WORKSPACE_SIZE = EnvInt(384 * 1024 * 1024)
+    # Kernel family the ROCm flashinfer port dispatches to: "fa2" (in-tree HIP),
+    # "aiter" (AITER), or "auto" (AITER when compatible, else fa2). Defaults to
+    # "fa2": "auto" would make an aiter-vs-flashinfer_rocm benchmark compare
+    # AITER with itself, and it silently drops kwargs AITER cannot honor.
+    SGLANG_FLASHINFER_ROCM_BACKEND = EnvStr("fa2")
     # Enable NVFP4 per-token activation scaling path for FlashInfer TRT-LLM MoE.
     SGLANG_FLASHINFER_NVFP4_PER_TOKEN_ACTIVATION = EnvBool(False)
     # Launch the TRT-LLM MoE grouped GEMMs with PDL only at or below this

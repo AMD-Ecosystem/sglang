@@ -358,6 +358,26 @@ def is_flashinfer_available():
 
 
 @lru_cache(maxsize=1)
+def is_flashinfer_rocm_available():
+    """
+    Check whether the ROCm port of flashinfer (AMD-Ecosystem/flashinfer,
+    distributed as the `amd-flashinfer` wheel) is available.
+
+    Kept separate from is_flashinfer_available(): both wheels import as
+    `flashinfer` but expose different APIs, and is_flashinfer_available()
+    gates NVIDIA-only defaulting that must stay False on ROCm.
+    """
+    if not get_bool_env_var("SGLANG_IS_FLASHINFER_AVAILABLE", default="true"):
+        return False
+    return importlib.util.find_spec("flashinfer") is not None and is_hip()
+
+
+# gfx942 = CDNA3 (MI300X / MI325X), gfx950 = CDNA4 (MI355X). The ROCm flashinfer
+# port compiles kernels for these two architectures only.
+FLASHINFER_ROCM_SUPPORTED_ARCHS = ("gfx942", "gfx950")
+
+
+@lru_cache(maxsize=1)
 def is_tokenspeed_mla_available():
     """
     Check whether the tokenspeed_mla CuTe DSL kernels are available.

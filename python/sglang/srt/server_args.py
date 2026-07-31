@@ -195,6 +195,7 @@ ATTENTION_BACKEND_CHOICES = [
     # AMD specific
     "aiter",
     "wave",
+    "flashinfer_rocm",  # AMD-Ecosystem/flashinfer ROCm port, requires amd-flashinfer
     # Other platforms
     "intel_amx",
     "ascend",
@@ -5625,6 +5626,106 @@ class ServerArgs:
             else:
                 return "triton"
 
+    def _validate_flashinfer_rocm_backend(self):
+        """Reject flashinfer_rocm configurations the ROCm port cannot serve.
+
+        Fails at startup rather than deep inside the first forward, and covers
+        the cases the port silently mishandles rather than erroring on.
+        """
+        import torch
+
+        from sglang.srt.utils import (
+            FLASHINFER_ROCM_SUPPORTED_ARCHS,
+            is_flashinfer_rocm_available,
+        )
+
+        if not is_hip():
+            raise ValueError(
+                "--attention-backend flashinfer_rocm requires an AMD ROCm GPU. "
+                "On NVIDIA, use --attention-backend flashinfer."
+            )
+
+        if not is_flashinfer_rocm_available():
+            raise ValueError(
+                "--attention-backend flashinfer_rocm requires the amd-flashinfer "
+                "package. Install it with:\n"
+                "  pip install amd-flashinfer "
+                "--extra-index-url https://pypi.amd.com/rocm-7.2.0/simple/"
+            )
+
+        arch = torch.cuda.get_device_properties(0).gcnArchName.split(":")[0]
+        if arch not in FLASHINFER_ROCM_SUPPORTED_ARCHS:
+            raise ValueError(
+                f"--attention-backend flashinfer_rocm supports "
+                f"{', '.join(FLASHINFER_ROCM_SUPPORTED_ARCHS)}, but this GPU is {arch}."
+            )
+
+        if self.page_size not in (None, 1):
+            raise ValueError(
+                f"flashinfer_rocm requires --page-size 1 (got {self.page_size})."
+            )
+
+        # Prefill graph capture is unimplemented for both variants; the backend
+        # raises on any non-decode capture rather than record a wrong graph.
+        # Disable it here (HRM-Text precedent) so the default does not trip it.
+        self._disable_cuda_graph_phases(
+            ["prefill"],
+            reason="flashinfer_rocm does not implement prefill CUDA graphs",
+        )
+
+        if self.use_mla_backend():
+            prefill_backend, _ = self._resolved_attention_backends()
+            if prefill_backend == "flashinfer_rocm":
+                # DeepSeek prefill is ragged attention at head_dim_qk=192 /
+                # head_dim_vo=128. The ROCm fa2 kernel fails to *compile* for
+                # that shape (its k128B_16Row swizzle static_asserts on a
+                # power-of-2 stride, and 192 is not), and AITER rejects
+                # head_dim_qk != head_dim_vo outright. There is no working
+                # prefill path, so stop here rather than after several minutes
+                # of JIT that ends in a compiler error.
+                raise ValueError(
+                    "flashinfer_rocm cannot serve MLA prefill: the ROCm kernels "
+                    "support neither head_dim_qk=192 / head_dim_vo=128 (fa2 fails "
+                    "to compile) nor unequal Q/KV head dims (AITER rejects them). "
+                    "Use MLA decode only, with prefill on another backend:\n"
+                    "  --prefill-attention-backend aiter "
+                    "--decode-attention-backend flashinfer_rocm"
+                )
+
+            # mla_rocm dispatches to AITER only, and its wrapper takes no
+            # use_cuda_graph / buffer kwargs at all -- so decode graphs go too.
+            self._disable_cuda_graph_phases(
+                ["decode"],
+                reason=(
+                    "flashinfer_rocm MLA does not support CUDA graphs (the ROCm "
+                    "BatchMLAPagedAttentionWrapper has no use_cuda_graph support)"
+                ),
+            )
+
+    def _disable_cuda_graph_phases(self, phases: list[str], *, reason: str):
+        """Force-disable graph capture for the named phases, with a warning.
+
+        Follows the HRM-Text precedent: adjust rather than error, so a default
+        config still starts. Both the per-phase config and the legacy boolean
+        need setting — flipping the boolean alone would not stop capture, and
+        the boolean only means "no graphs at all" once every phase is off.
+        """
+        already_off = [
+            phase
+            for phase in phases
+            if self.cuda_graph_config[phase].backend is Backend.DISABLED
+        ]
+        if len(already_off) == len(phases):
+            return
+
+        for phase in phases:
+            self.cuda_graph_config[phase].backend = Backend.DISABLED
+        self.disable_cuda_graph = all(
+            self.cuda_graph_config[phase].backend is Backend.DISABLED
+            for phase in Phase.ALL
+        )
+        logger.warning("%s; disabling %s graph capture.", reason, "/".join(phases))
+
     def _handle_attention_backend_compatibility(self):
         model_config = self.get_model_config()
 
@@ -5717,6 +5818,9 @@ class ServerArgs:
         if resolved_view(self).attention_backend == "aiter":
             if model_config.context_len > 8192:
                 self.mem_fraction_static *= 0.85
+
+        if "flashinfer_rocm" in self._resolved_attention_backends():
+            self._validate_flashinfer_rocm_backend()
 
         # Other platforms backends
         run_post_process_pass(self, _attention_backend_platform_fallbacks)
