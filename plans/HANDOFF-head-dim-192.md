@@ -1,4 +1,13 @@
-# Handoff: prefill kernels do not compile at head_dim 192 (gfx942)
+# Handoff: two ROCm FlashInfer items (gfx942)
+
+1. **head_dim 192 does not compile** — blocks DeepSeek/MLA prefill outright.
+2. **The HIP fa2 decode kernel is ~1.8x slower than AITER** — a 7-11%
+   end-to-end deficit at 7B.
+
+Plus a release item: the published `amd-flashinfer` wheel has a causal-prefill
+correctness bug that is already fixed in git but not on the index.
+
+# Item 1: prefill kernels do not compile at head_dim 192
 
 Written 2026-07-31 from the SGLang `flashinfer_rocm` backend work, and kept in
 the SGLang tree because that is where the evidence was produced. The work it
@@ -148,3 +157,103 @@ w.run(q, k, v)   # fails during JIT compile
 ```
 
 Swap `192 -> 128` or `-> 256` (with matching vo) to see it pass.
+
+---
+
+# Second item: the HIP fa2 decode kernel is ~1.8x slower than AITER
+
+Independent of the head_dim-192 bug, and the larger of the two in end-user
+terms. This is a performance gap, not a correctness one.
+
+## The measurement
+
+SGLang's `flashinfer_rocm` backend trails `--attention-backend aiter` on decode.
+Locating that gap at batch 8 on TinyLlama-1.1B (22 layers, 32/4 heads,
+`head_dim=64`), where the end-to-end step gap is 0.50 ms:
+
+| Component | flashinfer_rocm | aiter | gap | share |
+| --- | ---: | ---: | ---: | ---: |
+| attention metadata prep, per step | 0.190 ms | 0.080 ms | 0.109 ms | 22% |
+| attention kernels | — | — | ~0.39 ms | **78%** |
+
+Direct kernel timing, `BatchDecodeWithPagedKVCacheWrapper(backend="fa2",
+use_tensor_cores=False)` at batch 8, seq 544, `page_size=1`:
+
+```
+fa2 decode run(): 0.0405 ms/call
+x22 layers      : 0.891 ms/step of attention
+```
+
+Closing the 0.39 ms residual requires AITER to be about **1.78x faster per
+call** (0.0405 -> 0.0228 ms). That is an unremarkable margin between hand-tuned
+CDNA3 assembly/CK and a HIP port of a CUDA kernel, and it is consistent across
+model sizes: the absolute gap holds near 0.6 ms/step on both TinyLlama-1.1B and
+Mistral-7B, and across batch 1 / 8 / 32.
+
+At 7B this leaves `flashinfer_rocm` within 7-11% of AITER on decode — so the
+gap is not alarming, but it is the single largest remaining item.
+
+## What this rules out
+
+- **Not the plan path.** A full ROCm `plan()` call is 0.070 ms, dropping to
+  0.029 ms when handed host-resident `indptr` / `last_page_len` / `seq_lens`.
+  The device-to-host sync is therefore ~0.039 ms, about 8% of the step gap.
+  SGLang now passes host-resident inputs, which banked exactly that.
+- **Not visible in eager mode.** With CUDA graphs off, `fa2` measures *ahead*
+  of AITER on decode (710 vs 671 tok/s at batch 8). That is misleading: eager
+  pays per-layer Python and launch overhead on both sides that swamps a
+  0.02 ms/call kernel difference. Only graph-captured runs isolate kernel time.
+  Do not use eager numbers to evaluate this.
+
+## Where to look
+
+`BatchDecodeWithPagedKVCacheWrapper` with `backend="fa2"`,
+`use_tensor_cores=False`, `page_size=1`, `kv_layout="NHD"`, bf16 — the
+configuration SGLang drives. Worth checking first:
+
+1. **`page_size=1` overhead.** SGLang's ROCm default is 1, so every KV index is
+   its own page. If the HIP decode kernel has a per-page cost, this is the
+   worst case for it. Comparing 0.0405 ms/call at page_size 1 against larger
+   page sizes at equal total KV would isolate that quickly.
+2. **`use_tensor_cores=False`.** SGLang picks this because AITER decode
+   requires it, but the in-tree HIP path may do better with MFMA enabled.
+   Cheap to test.
+3. **GQA group 4/8 specifically.** The dispatch instantiates group sizes
+   1/2/3/4/8 (`include/gpu_iface/dispatch.cuh`); 4 and 8 are what real models
+   hit (Llama-3.x and Mistral are 4, TinyLlama is 8).
+
+## Reproducer
+
+```python
+import time, torch, flashinfer
+dev, dtype = "cuda", torch.bfloat16
+HQ, HKV, HD, BS, SEQ = 32, 4, 64, 8, 544
+ws = torch.empty(128 << 20, dtype=torch.uint8, device=dev)
+n = BS * SEQ
+k = torch.randn(n, HKV, HD, dtype=dtype, device=dev)
+v = torch.randn(n, HKV, HD, dtype=dtype, device=dev)
+kv = (k.view(n, 1, HKV, HD), v.view(n, 1, HKV, HD))
+indptr = torch.arange(BS + 1, dtype=torch.int32, device=dev) * SEQ
+indices = torch.arange(n, dtype=torch.int32, device=dev)
+lpl = torch.ones(BS, dtype=torch.int32, device=dev)
+q = torch.randn(BS, HQ, HD, dtype=dtype, device=dev)
+w = flashinfer.BatchDecodeWithPagedKVCacheWrapper(ws, "NHD", backend="fa2",
+                                                  use_tensor_cores=False)
+w.plan(indptr, indices, lpl, HQ, HKV, HD, 1,
+       q_data_type=dtype, kv_data_type=dtype, non_blocking=True)
+for _ in range(50):
+    w.run(q, kv)
+torch.cuda.synchronize()
+t0 = time.perf_counter()
+for _ in range(500):
+    w.run(q, kv)
+torch.cuda.synchronize()
+print(f"{(time.perf_counter()-t0)/500*1000:.4f} ms/call")   # 0.0405 on MI300X
+```
+
+## Priority against the head_dim-192 bug
+
+They serve different ends. **head_dim 192 is a capability gap** — it blocks
+DeepSeek/MLA prefill entirely, so no amount of tuning substitutes for it. **The
+decode kernel is a performance gap** of 7-11% at 7B, which is a real but
+survivable deficit against AITER. If only one gets attention, 192 unblocks more.
