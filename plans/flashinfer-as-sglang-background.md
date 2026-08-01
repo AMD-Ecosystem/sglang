@@ -33,7 +33,7 @@ locally, **not pushed**.
 | M2 MHA eager | Done | 69K tok/s prefill, 1650 tok/s decode (TinyLlama-1.1B) |
 | M3 CUDA graphs | Done (decode only) | 4.6× over eager; output still matches aiter |
 | M4 MLA | **Decode-only; prefill impossible** | see "MLA is decode-only" below |
-| M5 tests | Kernel 3/3 green; E2E MMLU green; **one class still unrun** | see "What is not exercised" |
+| M5 tests | Kernel 3/3, E2E MMLU, and aiter-equivalence all green | equivalence test rewritten — see below |
 | M6 benchmark | Done | `benchmark/flashinfer_rocm/README.md`; TinyLlama + Mistral-7B |
 | M7 optimization | In-scope part done | 78% of the gap is upstream kernel work — see below |
 | M8 docs | Done | `attention_backend.mdx` matrix row + launch section |
@@ -108,12 +108,37 @@ the rest is that ROCm's `BatchMLAPagedAttentionWrapper` takes no
   itself** — fails with "AITER .so not found" until `aiter.ops.mha.
   mha_varlen_fwd` is called separately with matching dtype/causal/lse.
 
+### Correctness: three-way agreement
+
+The equivalence test now runs, and its first two versions were both unsound —
+worth recording, because each looked green or red for the wrong reason.
+
+1. **Exact output match passed, by luck.** Its prompts happened to miss a tie.
+   On a neighbouring prompt the backends split at token 7 where aiter's top two
+   candidates were equal to the last bit, and one flipped tie rewrites the tail.
+2. **Absolute-logprob comparison failed, spuriously.** `|Δ log p|` is
+   scale-distorted: 8.3% vs 6.5% on the chosen token reads as 0.2575 in log
+   space.
+
+Settled by adding a third backend. Max Δ**probability** on the chosen token over
+tokens both selected identically (Mistral-7B, 32 tokens, 4 prompts):
+
+| pair | max Δp | token agreement |
+| --- | ---: | --- |
+| `flashinfer_rocm` vs `triton` | **0.031** | 32/32 |
+| `flashinfer_rocm` vs `aiter` | 0.101 | 32/32 |
+| `aiter` vs `triton` | **0.109** | 32/32 |
+
+**`flashinfer_rocm` is 3.5× closer to the triton reference than aiter is**, and
+the fi-vs-aiter figure is essentially aiter's own deviation from triton. The
+test threshold (0.15) is now derived from that spread rather than picked —
+anything below 0.109 would fail known-good backends.
+
+Also established: `flashinfer_rocm` is bit-deterministic across server launches
+(0.0000 delta, 32/32), so cross-backend deltas are real differences, not noise.
+
 ### What is not exercised
 
-- **`TestFlashInferRocmMatchesAiter` has never run.** The equivalent comparison
-  was done by hand (4/4 TinyLlama, 3/4 Mistral with the tie explained), but the
-  test itself is committed and unexecuted — the same situation that produced a
-  false failure in the MMLU test.
 - **Prefill was never investigated.** All M7 work was decode. Prefill sits 5–10%
   behind aiter and two hypotheses are untested: `page_size > 1`, and the
   ragged + paged + `merge_state` split deliberately skipped in M2. Prefill

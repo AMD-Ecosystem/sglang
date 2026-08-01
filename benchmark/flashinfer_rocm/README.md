@@ -256,9 +256,42 @@ both texts rather than asserting on the first: **exact match across kernels is
 not a sound correctness bar**, and a failure there needs this same logprob check
 before it means anything.
 
-Kernel-level agreement is the load-bearing check instead: causal paged prefill,
+Kernel-level agreement is one load-bearing check: causal paged prefill,
 non-causal prefill, and decode each match a torch SDPA reference to <0.01 in
-`test/registered/kernels/test_flashinfer_rocm_attention_kernels.py`.
+`test/registered/kernels/test_flashinfer_rocm_attention_kernels.py`. That only
+covers a single forward pass, though — the three-way comparison below covers the
+autoregressive loop.
+
+### Three-way agreement, and which backend is the outlier
+
+Comparing two backends tells you they differ, not which one is right. Max
+absolute difference in the **probability** assigned to the chosen token, over
+the tokens both backends selected identically (Mistral-7B, 32 tokens, 4 prompts):
+
+| pair | max Δp | token agreement |
+| --- | ---: | --- |
+| `flashinfer_rocm` vs `triton` | **0.031** | 32/32 |
+| `flashinfer_rocm` vs `aiter` | 0.101 | 32/32 |
+| `aiter` vs `triton` | **0.109** | 32/32 |
+
+**`flashinfer_rocm` is 3.5x closer to the `triton` reference than `aiter` is.**
+The `flashinfer_rocm`-vs-`aiter` figure (0.101) is essentially `aiter`'s own
+deviation from `triton` (0.109), so that gap is dominated by `aiter`, not by
+this backend. All three pick identical tokens at every position; they differ
+only in how much probability mass sits on them, which is the room bf16 attention
+has where the model is uncertain.
+
+Two methodology notes, both learned the hard way here:
+
+- **Compare probabilities, not logprobs.** `|Δ log p|` is scale-distorted: a
+  step where two backends put 8.3% vs 6.5% on the chosen token — a difference of
+  0.019 that matters to nobody — reads as 0.2575 in log space. An earlier
+  revision of the equivalence test used log space and failed 2/4 prompts on
+  what was almost entirely this artifact.
+- **`flashinfer_rocm` is bit-deterministic across server launches** (0.0000
+  delta, 32/32 tokens, all prompts), so any cross-backend delta is a real
+  implementation difference rather than run-to-run noise. Worth re-establishing
+  before reading anything into a comparison.
 
 Kernel-level checks live in
 `test/registered/kernels/test_flashinfer_rocm_attention_kernels.py`; end-to-end
