@@ -205,6 +205,36 @@ gap is not alarming, but it is the single largest remaining item.
   0.02 ms/call kernel difference. Only graph-captured runs isolate kernel time.
   Do not use eager numbers to evaluate this.
 
+## Do not trade away accuracy to close this
+
+`fa2` is currently the *more* accurate of the two, so a naive chase of AITER's
+speed could regress something that is presently better. Max absolute difference
+in the probability assigned to the chosen token, over tokens each pair selected
+identically (Mistral-7B, 32 tokens, 4 prompts, via SGLang):
+
+| pair | max Δp |
+| --- | ---: |
+| `fa2` (flashinfer_rocm) vs `triton` | **0.031** |
+| `fa2` vs AITER | 0.101 |
+| AITER vs `triton` | **0.109** |
+
+`fa2` sits 3.5x closer to the `triton` reference than AITER does, and the
+fa2-vs-AITER figure is essentially AITER's own deviation from `triton`. All
+three pick identical tokens at every position; they differ only in how much
+probability mass sits on them.
+
+Two implications:
+
+1. Some of AITER's speed may be bought with numerical shortcuts. Matching its
+   *time* is the goal; matching its *numerics* is not.
+2. Whatever changes here, re-run the three-way comparison rather than a pairwise
+   one. A pairwise delta cannot tell you which side moved — that mistake nearly
+   sent this investigation after a non-existent bug in `fa2`.
+
+Compare probabilities, not logprobs: `|Δ log p|` is scale-distorted, and a step
+where two backends put 8.3% vs 6.5% on the chosen token reads as 0.2575 in log
+space while being irrelevant.
+
 ## Where to look
 
 `BatchDecodeWithPagedKVCacheWrapper` with `backend="fa2"`,
