@@ -23,7 +23,8 @@ this plan is SGLang-only.)
 
 ## Status (2026-07-31)
 
-Implemented on branch `feat/flashinfer-rocm-attention-backend`, **uncommitted**.
+Implemented on branch `feat/flashinfer-rocm-attention-backend`, committed
+locally, **not pushed**.
 
 | Milestone | State | Evidence |
 | --- | --- | --- |
@@ -32,27 +33,52 @@ Implemented on branch `feat/flashinfer-rocm-attention-backend`, **uncommitted**.
 | M2 MHA eager | Done | 69K tok/s prefill, 1650 tok/s decode (TinyLlama-1.1B) |
 | M3 CUDA graphs | Done (decode only) | 4.6× over eager; output still matches aiter |
 | M4 MLA | **Decode-only; prefill impossible** | see "MLA is decode-only" below |
-| M5 tests | Kernel 3/3 green; **E2E unrun** | E2E needs Llama-3.1-8B (gated, no HF_TOKEN) |
-| M6 benchmark | Done | `benchmark/flashinfer_rocm/README.md` |
-| M7 optimization | Not started | target identified — see "Where the time goes" |
+| M5 tests | Kernel 3/3 green; E2E MMLU green; **one class still unrun** | see "What is not exercised" |
+| M6 benchmark | Done | `benchmark/flashinfer_rocm/README.md`; TinyLlama + Mistral-7B |
+| M7 optimization | In-scope part done | 78% of the gap is upstream kernel work — see below |
 | M8 docs | Done | `attention_backend.mdx` matrix row + launch section |
 
-**Headline correctness result:** greedy decoding over 4 prompts, CUDA graphs on
-for both — 4/4 outputs byte-identical between `flashinfer_rocm` and `aiter`.
+**Headline correctness result:** greedy decoding with CUDA graphs on for both —
+4/4 outputs byte-identical to `aiter` on TinyLlama, 3/4 on Mistral-7B. The one
+Mistral divergence is a tie-break, not a wrong result: at output token 7 aiter's
+top two candidates are exactly equal (-2.19410 both), so greedy picks between
+them on tie-break order and the sequences separate from there. Exact output
+match is therefore **not** a sound cross-kernel correctness bar; the kernel-level
+SDPA comparison (<0.01) is the load-bearing check.
 
-### Where the time goes (drives M7)
+### Where the time goes — measured (M7)
 
-With graphs on, AITER leads; the MHA decode gap is ~0.5 ms and **flat** from
-batch 1 to batch 32 (0.49 / 0.55 / 0.57 ms). A gap that does not grow with 32×
-the work is fixed per-step overhead, not kernel cost. Eager-to-eager at batch 8
-the in-tree HIP kernel is *ahead* of AITER on decode (710 vs 671 tok/s).
+An earlier revision of this section blamed the plan path for the whole decode
+gap. That was **wrong**, and the correction is the main M7 finding. The
+reasoning was superficially sound — the gap is a flat ~0.6 ms across model
+sizes and batch sizes, which is the signature of fixed per-step overhead, and
+SGLang's NVIDIA backend carries a `fast_decode_plan` that the ROCm port lacks —
+but the attribution was a guess written up as a conclusion.
 
-The cost is the plan path: this backend calls the public ROCm `plan()` every
-decode step, and SGLang's NVIDIA backend uses `fast_decode_plan` precisely to
-skip the device-to-host copies inside `plan()`. The ROCm port exports no
-equivalent. **Making the plan path sync-free is the top optimization**, ahead of
-anything kernel-side. `mla_rocm.plan()` additionally calls
-`qo_lens.max().item()` — an explicit host sync — every step.
+Measured at batch 8 on TinyLlama (22 layers), step gap 0.50 ms:
+
+| Component | flashinfer_rocm | aiter | gap | share |
+| --- | ---: | ---: | ---: | ---: |
+| `init_forward_metadata_out_graph` | 0.190 ms | 0.080 ms | 0.109 ms | 22% |
+| attention kernels | — | — | ~0.39 ms | **78%** |
+
+Within the metadata, a whole `plan()` call is 0.070 ms, falling to 0.029 ms on
+host-resident inputs — so the D2H sync is 0.039 ms, ~8% of the step gap. That
+part is **done**: `plan()` now receives pinned host mirrors plus the scheduler's
+`seq_lens_cpu`, measured 0.190 → 0.146 ms/step with output unchanged.
+
+The remaining ~0.39 ms is the decode kernel. `fa2` decode `run()` is
+0.0405 ms/call, i.e. 0.891 ms/step over 22 layers; closing 0.39 ms needs AITER
+to be ~1.78× faster per call. **That is kernel work in AMD-Ecosystem/flashinfer,
+not something this backend can fix** — see `HANDOFF-head-dim-192.md`.
+
+Also retracted: eager mode showing `fa2` ahead of AITER does *not* clear the
+kernel. Eager pays per-layer Python and launch overhead on both sides that
+swamps a 0.02 ms/call difference. Only graph-captured runs isolate kernel time.
+
+Still open in-scope: metadata is 0.146 ms vs aiter's 0.074 ms, so ~0.072 ms
+remains in the kv-indices build. Low value against a gap that is already only
+7–11% at 7B.
 
 ### MLA is decode-only
 
@@ -82,12 +108,33 @@ the rest is that ROCm's `BatchMLAPagedAttentionWrapper` takes no
   itself** — fails with "AITER .so not found" until `aiter.ops.mha.
   mha_varlen_fwd` is called separately with matching dtype/causal/lse.
 
-### Open
+### What is not exercised
 
-- **8B numbers missing.** All benchmarks are TinyLlama-1.1B, which understates
-  attention's share of runtime. Needs `HF_TOKEN` at `~/.cache/huggingface/token`
-  (already bind-mounted into the container).
-- **Nothing committed.**
+- **`TestFlashInferRocmMatchesAiter` has never run.** The equivalent comparison
+  was done by hand (4/4 TinyLlama, 3/4 Mistral with the tie explained), but the
+  test itself is committed and unexecuted — the same situation that produced a
+  false failure in the MMLU test.
+- **Prefill was never investigated.** All M7 work was decode. Prefill sits 5–10%
+  behind aiter and two hypotheses are untested: `page_size > 1`, and the
+  ragged + paged + `merge_state` split deliberately skipped in M2. Prefill
+  dominates at long context, so this may matter more than the decode remainder.
+
+### Open decisions
+
+- **Push target.** `origin` is `sgl-project/sglang` itself, so pushing publishes
+  a branch on the official repo rather than backing anything up.
+- **The `amd.1` disclosure.** The published wheel's causal-prefill bug is
+  documented in `benchmark/flashinfer_rocm/README.md`, `plans/`, and the error
+  message in `docker/rocm-flashinfer-smoke.py`. Accurate and verified, but no
+  fixed wheel is on the index yet.
+- **Upstream PR or internal branch?** Changes what else is needed.
+
+### Model access notes
+
+`meta-llama/*` is gated for this account and `lmsys/sglang-ci-dsv3-test` is
+private, so: Mistral-7B-Instruct-v0.3 substitutes for Llama-3.1-8B (identical
+32/8 attention shape) via `SGLANG_TEST_ATTENTION_MODEL`, and
+`deepseek-ai/DeepSeek-V2-Lite` substitutes for the MLA CI model.
 
 ## Ground truth established during exploration
 
@@ -258,7 +305,7 @@ Pin `backend="fa2"` (in-tree HIP) for the first correctness pass, not `"auto"`.
 Rationale: `"auto"` silently reroutes to AITER, which would make this a
 comparison of AITER against itself and would silently drop unsupported kwargs.
 Expose `SGLANG_FLASHINFER_ROCM_BACKEND` (env var, per
-[`env-var-conventions`](../skills/env-var-conventions/SKILL.md)) to switch
+[`env-var-conventions`](../.claude/skills/env-var-conventions/SKILL.md)) to switch
 between `fa2` / `aiter` / `auto` for later A/B runs.
 
 **Verify:** `--attention-backend flashinfer_rocm --disable-cuda-graph` on
@@ -364,7 +411,7 @@ Add a backend-equivalence test built on
 cross-backend comparison harness with an `accuracy_threshold`) comparing
 `flashinfer_rocm` against `aiter`.
 
-Per [`unit-test-admission`](../rules/unit-test-admission.md), each case must
+Per [`unit-test-admission`](../.claude/rules/unit-test-admission.md), each case must
 guard a distinct failure mode — the capture-at-max-seq-len rule and the
 "auto silently reroutes to AITER" trap are the two worth pinning explicitly.
 
@@ -391,18 +438,34 @@ under `benchmark/` so regressions are visible over time.
 
 ## M7 — Optimization
 
-Only after M6 gives a baseline. Likely levers, highest expected value first:
+**Status: the in-scope part is done.** See "Where the time goes" above for the
+measurement that reorganised this list — 78% of the decode gap is kernel work in
+the ROCm fork, not anything reachable from SGLang.
 
-1. **Page size** — move off `page_size=1` to hit AITER CK FMHA's native sizes and
-   drop the gather.
-2. **Plan-side host syncs** — M3 deliberately uses the public `plan()`. Confirmed
-   sync: MLA's `plan()` calls `qo_lens.max().item()` (`mla_rocm.py:216`) every
-   step. The NVIDIA backend avoids this class of cost with `fast_decode_plan` /
-   `fast_prefill_plan`; the ROCm equivalents don't exist. Either upstream a
-   sync-free plan into the fork or precompute the maxima host-side in SGLang.
-3. **`backend="aiter"` under CUDA graph** — if AITER kernels win but only capture
-   under explicit opt-in, that combination is where the throughput is.
-4. **fp8 KV cache** — supported on the HIP decode path (E4M3FNUZ); measure.
+Done:
+
+- **Host-resident `plan()` inputs.** `plan()` did `indptr.to("cpu")` and
+  `last_page_len.to("cpu")` unconditionally; it now gets pinned host mirrors plus
+  the scheduler's `seq_lens_cpu`. Measured 0.190 → 0.146 ms/step of metadata,
+  output unchanged.
+
+Handed off to AMD-Ecosystem/flashinfer (`HANDOFF-head-dim-192.md`):
+
+- **Decode kernel**, ~0.39 ms/step of the 0.50 ms gap. `fa2` decode `run()` is
+  0.0405 ms/call; AITER would need ~1.78× per call to close it.
+
+Still open here, in rough value order:
+
+1. **Prefill.** Never investigated — all M7 work was decode. Prefill is 5–10%
+   behind aiter, and two hypotheses are untested: `page_size > 1`, and the
+   ragged + paged + `merge_state` split skipped in M2. Prefill dominates at long
+   context, so this plausibly outranks the decode remainder.
+2. **Remaining metadata**, 0.146 ms vs aiter's 0.074 ms — the kv-indices build.
+   Low value against a 7–11% total gap at 7B.
+3. **MLA `plan()` host sync** — `qo_lens.max().item()` (`mla_rocm.py:216`) every
+   step. Only matters if MLA becomes usable, which needs the head_dim-192 fix
+   *and* a CUDA-graph-capable MLA wrapper upstream.
+4. **fp8 KV cache** — supported on the HIP decode path (E4M3FNUZ); unmeasured.
 
 ## M8 — Docs and environment maintenance
 
