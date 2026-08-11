@@ -14,8 +14,15 @@ no risk from ROCm changes.
 
 Scope of this backend, and why each limit exists:
 
-  * ``page_size`` must be 1 — matches SGLang's ROCm default and the ROCm MLA
-    kernel's only supported page size.
+  * ``page_size`` must be 1. This is a limitation of *this backend*, not of the
+    ROCm kernels: the fa2 MHA path runs prefill and decode correctly at page
+    sizes 1, 16, 64 and 128 (verified on gfx942). The restriction is here
+    because MLA genuinely requires page_size=1, and because it makes the
+    paged-KV view a free reshape — the pool hands over ``[num_tokens, H, D]``,
+    which is already ``[num_pages, 1, H, D]``. Lifting it for MHA needs
+    page-granular kv-indices, and is the first prefill optimization to try:
+    AITER's CK FMHA prefers ``{128, 256, 1024}``, so page_size=1 forces a
+    gather on that path.
   * No sliding-window models — the ROCm wrappers take ``window_left`` at plan
     time, so per-layer windows would need one wrapper per distinct window (what
     the NVIDIA backend's ``WrapperDispatch`` does). Rejected rather than
@@ -26,6 +33,10 @@ Scope of this backend, and why each limit exists:
     and then drops them in ``run()``, which would silently produce wrong output.
   * MLA is eager-only — ``mla_rocm.BatchMLAPagedAttentionWrapper`` has no
     ``use_cuda_graph`` support at all.
+  * Prefill CUDA graphs are not implemented. Note this costs nothing today:
+    ROCm resolves ``prefill`` to ``disabled`` for *every* attention backend
+    (aiter and triton included), so the explicit disable in
+    ``_validate_flashinfer_rocm_backend`` is redundant rather than a handicap.
 """
 
 import logging

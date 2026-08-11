@@ -29,8 +29,9 @@ contended baseline that penalised one side unequally would have invalidated the
 central claim.
 
 `one_batch` prints a warmup pass and then a benchmark pass; the tables below use
-the **benchmark** pass. CUDA graphs are on for both backends (decode only for
-`flashinfer_rocm` — it does not implement prefill graphs).
+the **benchmark** pass. Decode CUDA graphs are on for both backends; prefill
+graphs are off for both, because ROCm disables that phase for every attention
+backend (see caveats).
 
 Select the kernel family behind `flashinfer_rocm` with
 `SGLANG_FLASHINFER_ROCM_BACKEND` (`fa2` default / `aiter` / `auto`).
@@ -161,12 +162,11 @@ decode, which rules out the kernel as the cause.
 | `flashinfer_rocm`, `aiter` kernels | 161,124 | 564 |
 | `aiter` backend | 186,336 | 671 |
 
-So `fa2` decode is competitive; CUDA graphs just help AITER more (6.3× vs 4.6×).
-The prime suspect is the plan path: this backend calls the public ROCm `plan()`
-on every decode step, while SGLang's NVIDIA FlashInfer backend uses
-`fast_decode_plan` specifically to skip the device-to-host copies inside
-`plan()`. The ROCm port exports no equivalent. Making the plan path sync-free is
-therefore the highest-value optimization, ahead of anything kernel-side.
+So `fa2` decode is competitive here; CUDA graphs just help AITER more (6.3× vs
+4.6×). Read this table only as evidence that the eager kernel is not obviously
+deficient — **not** as evidence about where the graph-mode gap comes from. See
+"Attributing the gap" above: the plan path is ~8% of it and the kernel ~78%, and
+eager cannot resolve a 0.02 ms/call difference through per-layer Python overhead.
 
 Prefill is a separate story: `aiter` leads there in every mode, and part of that
 is `page_size=1` (see caveats).
@@ -177,11 +177,22 @@ is `page_size=1` (see caveats).
   8B, and prefill numbers at this size are dominated by launch overhead. Re-run
   on Llama-3.1-8B (32/8 → GQA group 4) before drawing conclusions about
   production shapes.
-- **`page_size=1`.** `flashinfer_rocm` supports nothing else today, and AITER's
-  CK FMHA prefers `{128, 256, 1024}`. Part of the prefill gap is likely the extra
-  gather this forces; sweeping page size is the first optimization to try.
-- **Prefill CUDA graphs are off for `flashinfer_rocm`** and available to `aiter`,
-  which flatters `aiter` on the prefill rows.
+- **`page_size=1`, and that is this backend's restriction, not the kernel's.**
+  Verified directly: the ROCm `fa2` MHA path runs prefill and decode correctly at
+  page sizes 1, 16, 64 and 128. `flashinfer_rocm` pins 1 because MLA genuinely
+  requires it and because it makes the paged-KV view a no-op reshape — the pool's
+  `[num_tokens, H, D]` is already `[num_pages, 1, H, D]`. Lifting it needs
+  page-granular kv-indices, not a kernel change. AITER's CK FMHA prefers
+  `{128, 256, 1024}`, so part of the prefill gap is plausibly the gather that
+  page-size 1 forces; this is the first prefill optimization to try.
+- **Prefill CUDA graphs are off for every backend on ROCm**, so they do not skew
+  the comparison. An earlier revision of this file claimed they were available to
+  `aiter` but not to `flashinfer_rocm` and therefore flattered `aiter`; that was
+  wrong. The HIP default is `tc_piecewise`, and it is subsequently disabled —
+  resolving `ServerArgs` for `flashinfer_rocm`, `aiter` and `triton` on this host
+  yields `prefill=disabled` and `decode=full` for all three. `flashinfer_rocm`
+  also disables the phase explicitly, which is therefore redundant rather than a
+  handicap.
 - Single run per cell, no clock locking, on a shared machine. Treat differences
   under ~5% as noise.
 - **`SGLANG_FLASHINFER_ROCM_BACKEND=aiter` is impractical under CUDA graphs
