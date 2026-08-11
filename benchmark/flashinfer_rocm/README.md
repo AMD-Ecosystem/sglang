@@ -8,13 +8,25 @@ the established ROCm backend, so later changes have something to move.
 ```bash
 docker build -f docker/rocm-flashinfer.Dockerfile -t sglang:rocm-flashinfer .
 
-# Per backend, per batch size:
-python3 -m sglang.benchmark.one_batch \
-  --model-path TinyLlama/TinyLlama-1.1B-Chat-v1.0 \
-  --attention-backend {flashinfer_rocm|aiter} \
-  --batch-size {1|8|32} --input-len 512 --output-len 32 \
-  --cuda-graph-max-bs-decode 32
+# Throughput, all backends and batch sizes. Second arg pins the GPU.
+bash benchmark/flashinfer_rocm/bench_backends.sh \
+  mistralai/Mistral-7B-Instruct-v0.3 3
+
+# Numerical agreement, three-way. Re-run after any kernel change.
+python3 benchmark/flashinfer_rocm/compare_backends.py --gpu 3
 ```
+
+**Pin to an idle GPU.** This box is shared; check `rocm-smi --showmeminfo vram`
+first, where an idle CDNA3 card sits at ~0.3 GB. The first round of these
+numbers was collected on a device another process was using.
+
+That turned out not to matter — re-running the whole Mistral-7B sweep on an idle
+GPU reproduced the contended run within ~2% on every cell (decode ratio 0.888 →
+0.898, 0.897 → 0.917, 0.930 → 0.929; the absolute decode gap stayed 0.67 / 0.58
+/ 0.57 ms against 0.74 / 0.72 / 0.56 ms). Both backends were competing on equal
+terms, so the comparison held. Worth re-checking rather than assuming, since a
+contended baseline that penalised one side unequally would have invalidated the
+central claim.
 
 `one_batch` prints a warmup pass and then a benchmark pass; the tables below use
 the **benchmark** pass. CUDA graphs are on for both backends (decode only for
