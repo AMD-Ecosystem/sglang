@@ -177,14 +177,26 @@ is `page_size=1` (see caveats).
   8B, and prefill numbers at this size are dominated by launch overhead. Re-run
   on Llama-3.1-8B (32/8 → GQA group 4) before drawing conclusions about
   production shapes.
-- **`page_size=1`, and that is this backend's restriction, not the kernel's.**
-  Verified directly: the ROCm `fa2` MHA path runs prefill and decode correctly at
-  page sizes 1, 16, 64 and 128. `flashinfer_rocm` pins 1 because MLA genuinely
-  requires it and because it makes the paged-KV view a no-op reshape — the pool's
-  `[num_tokens, H, D]` is already `[num_pages, 1, H, D]`. Lifting it needs
-  page-granular kv-indices, not a kernel change. AITER's CK FMHA prefers
-  `{128, 256, 1024}`, so part of the prefill gap is plausibly the gather that
-  page-size 1 forces; this is the first prefill optimization to try.
+- **`page_size=1`, and it costs nothing.** It is this backend's restriction
+  rather than the kernel's — the ROCm `fa2` path runs correctly at page sizes 1
+  through 128 — but lifting it would not help. Measured at batch 8, seq 1024,
+  identical total KV, only the paging granularity varying:
+
+  | page_size | prefill ms | decode ms |
+  | ---: | ---: | ---: |
+  | 1 | 1.0546 | 0.0327 |
+  | 16 | 1.0583 | 0.0327 |
+  | 64 | 1.0605 | 0.0328 |
+  | 128 | 1.0608 | 0.0328 |
+  | 256 | 1.0612 | 0.0525 |
+
+  Flat within 0.6% up to 128, and page 256 makes decode 38% *worse*. An earlier
+  revision of this file called page-size sweeping "the first prefill
+  optimization to try", reasoning that AITER's CK FMHA prefers
+  `{128, 256, 1024}` and page-size 1 must therefore force a gather. That
+  reasoning does not apply: the default kernel family is `fa2`, not AITER, and
+  `fa2` is indifferent to page size. The page-granular kv-indices work has no
+  payoff and was abandoned on this evidence.
 - **Prefill CUDA graphs are off for every backend on ROCm**, so they do not skew
   the comparison. An earlier revision of this file claimed they were available to
   `aiter` but not to `flashinfer_rocm` and therefore flattered `aiter`; that was
@@ -244,6 +256,32 @@ Two separate effects, worth keeping apart:
 So MLA on this backend is a plumbing-correctness result, not a usable
 configuration. Closing the gap needs a CUDA-graph-capable MLA wrapper in the
 ROCm port, which is an upstream change.
+
+### Prefill: both optimization hypotheses tested, both weak
+
+Prefill trails `aiter` by 5-10%, and the two candidate explanations were
+measured rather than argued. Neither holds up.
+
+**Page size** — no effect; see the caveat below.
+
+**Paged vs ragged prefill.** This backend always uses the paged wrapper: KV goes
+to the pool first, then attention reads it through `kv_indices`, which costs a
+gather. The ragged wrapper takes contiguous k/v with no indirection, and for
+prefill with no prefix cache both compute the same thing. Measured:
+
+| batch | seq | paged ms | ragged ms | ragged speedup |
+| ---: | ---: | ---: | ---: | ---: |
+| 1 | 512 | 0.0736 | 0.0675 | 1.09x |
+| 8 | 512 | 0.3429 | 0.3700 | **0.93x** |
+| 8 | 2048 | 3.7860 | 3.5332 | 1.07x |
+| 32 | 512 | 1.3169 | 1.2410 | 1.06x |
+
+~4% on average, inconsistent, and paged is *faster* at batch 8 / seq 512. Adding
+the ragged + paged + `merge_state` split would buy little and cost a
+`merge_state` dependency on HIP.
+
+So prefill has the same shape as decode: the residual is the kernel, not the
+plumbing around it. There is no significant prefill headroom inside SGLang.
 
 ## Correctness
 

@@ -20,9 +20,9 @@ Scope of this backend, and why each limit exists:
     because MLA genuinely requires page_size=1, and because it makes the
     paged-KV view a free reshape — the pool hands over ``[num_tokens, H, D]``,
     which is already ``[num_pages, 1, H, D]``. Lifting it for MHA needs
-    page-granular kv-indices, and is the first prefill optimization to try:
-    AITER's CK FMHA prefers ``{128, 256, 1024}``, so page_size=1 forces a
-    gather on that path.
+    page-granular kv-indices -- but measurement says not to bother: the fa2
+    kernel is flat within 0.6% from page size 1 to 128, and page 256 makes
+    decode 38% worse. See benchmark/flashinfer_rocm/README.md.
   * No sliding-window models — the ROCm wrappers take ``window_left`` at plan
     time, so per-layer windows would need one wrapper per distinct window (what
     the NVIDIA backend's ``WrapperDispatch`` does). Rejected rather than

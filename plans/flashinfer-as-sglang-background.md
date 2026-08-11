@@ -139,10 +139,25 @@ Also established: `flashinfer_rocm` is bit-deterministic across server launches
 
 ### What is not exercised
 
-- **Prefill was never investigated.** All M7 work was decode. Prefill sits 5–10%
-  behind aiter and two hypotheses are untested: `page_size > 1`, and the
-  ragged + paged + `merge_state` split deliberately skipped in M2. Prefill
-  dominates at long context, so this may matter more than the decode remainder.
+- **Tensor parallelism.** Every run was `tp_size=1`. The backend reads
+  `get_parallel().attn_tp_size` but that path has never executed with TP > 1,
+  and multi-GPU is the normal serving configuration. Largest remaining gap.
+- **The CI suite** (`run_suite.py`) — tests were run individually.
+- **fp8 KV cache** — supported on the HIP decode path, never measured.
+
+### Prefill: investigated, no headroom found
+
+Both candidate optimizations were measured and neither survives.
+
+- **Page size**: the fa2 kernel is flat within 0.6% from page size 1 to 128;
+  page 256 makes decode 38% worse. The reasoning that motivated this (AITER's CK
+  FMHA prefers `{128, 256, 1024}`, so page-size 1 forces a gather) does not apply
+  — the default kernel family is `fa2`, which is indifferent.
+- **Ragged vs paged prefill**: ~4% on average, inconsistent, and paged is
+  *faster* at batch 8 / seq 512.
+
+So prefill mirrors decode — the residual is kernel, not plumbing. No significant
+prefill headroom inside SGLang.
 
 ### Open decisions
 
