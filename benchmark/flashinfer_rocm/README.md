@@ -214,9 +214,11 @@ is `page_size=1` (see caveats).
   only. Prebuilding the AITER kernel cache into the image would be needed to
   measure that combination under graphs.
 - FlashInfer's AITER prefill path dlopen's an AITER `.so` it cannot build
-  itself; `warm_aiter_mha.py`-style prewarming (calling `aiter.ops.mha.
-  mha_varlen_fwd` with matching dtype/causal/lse) is required first, otherwise
-  it fails with "AITER .so not found".
+  itself. This used to require `warm_aiter_mha.py`-style prewarming and
+  otherwise failed with "AITER .so not found"; upstream PRs #275 and #276 now
+  bootstrap the library and probe for native paging instead of trusting the
+  AITER version, so `backend=auto` resolves to AITER and runs unaided at page
+  sizes 1 through 256. Page size 1024 still fails a `dlsym` lookup.
 
 ## MLA (DeepSeek-V2-Lite)
 

@@ -6,11 +6,11 @@ Checks the three things that have actually broken here, in order of how quietly
 they fail:
 
   1. flashinfer imports, torch is a ROCm build, GPU is gfx942/gfx950.
-  2. BatchMLAPagedAttentionWrapper is exported. The published 0.5.3+amd.1 wheel
-     does not export it; MLA needs >= 0.5.3+amd.2.
-  3. Causal paged prefill matches a torch SDPA reference. 0.5.3+amd.1 returns
-     wrong values on *some* rows for causal prefill on gfx942 while non-causal
-     and decode are exact — so an import check alone will not catch it.
+  2. BatchMLAPagedAttentionWrapper is exported. Wheels older than the pinned
+     source build predate MLA support and do not export it.
+  3. Causal paged prefill matches a torch SDPA reference. This is the quiet
+     one: a build can return wrong values on *some* rows here while non-causal
+     prefill and decode stay exact, so an import check will not catch it.
 
 Exits non-zero on the first failure.
 """
@@ -50,9 +50,9 @@ def check_mla_exported() -> None:
 
     if not hasattr(flashinfer, "BatchMLAPagedAttentionWrapper"):
         _fail(
-            "BatchMLAPagedAttentionWrapper is not exported. The published "
-            "0.5.3+amd.1 wheel predates MLA support; rebuild the image with "
-            "FLASHINFER_MODE=source (the default) to get >= 0.5.3+amd.2."
+            "BatchMLAPagedAttentionWrapper is not exported. This build "
+            "predates MLA support; rebuild the image with "
+            "FLASHINFER_MODE=source (the default)."
         )
     print("PASS MLA wrapper exported")
 
@@ -71,7 +71,7 @@ def _reference(q, k, v, *, causal: bool):
 
 
 def check_causal_prefill() -> None:
-    """The 0.5.3+amd.1 regression: right shape, wrong values on some rows."""
+    """The failure this guards: right shape, finite, wrong on some rows."""
     import flashinfer
 
     device, dtype = "cuda", torch.bfloat16
@@ -117,7 +117,7 @@ def check_causal_prefill() -> None:
     if error > TOLERANCE:
         _fail(
             f"causal paged prefill disagrees with SDPA (max abs err {error:.4f} "
-            f"> {TOLERANCE}). Known-broken on 0.5.3+amd.1; needs >= 0.5.3+amd.2."
+            f"> {TOLERANCE}). Rebuild the image with FLASHINFER_MODE=source."
         )
     print(f"PASS causal prefill vs SDPA (max abs err {error:.4f})")
 

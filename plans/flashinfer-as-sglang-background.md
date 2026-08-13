@@ -70,7 +70,7 @@ part is **done**: `plan()` now receives pinned host mirrors plus the scheduler's
 The remaining ~0.39 ms is the decode kernel. `fa2` decode `run()` is
 0.0405 ms/call, i.e. 0.891 ms/step over 22 layers; closing 0.39 ms needs AITER
 to be ~1.78× faster per call. **That is kernel work in AMD-Ecosystem/flashinfer,
-not something this backend can fix** — see `HANDOFF-head-dim-192.md`.
+not something this backend can fix.**
 
 Also retracted: eager mode showing `fa2` ahead of AITER does *not* clear the
 kernel. Eager pays per-layer Python and launch overhead on both sides that
@@ -105,8 +105,12 @@ the rest is that ROCm's `BatchMLAPagedAttentionWrapper` takes no
   AITER JIT-builds a kernel variant per captured shape; a ladder to batch 32 was
   still compiling after 30 minutes on batch size 1 alone.
 - **FlashInfer's AITER prefill path `dlopen`s an AITER `.so` it cannot build
-  itself** — fails with "AITER .so not found" until `aiter.ops.mha.
-  mha_varlen_fwd` is called separately with matching dtype/causal/lse.
+  itself** — used to fail with "AITER .so not found" until `aiter.ops.mha.
+  mha_varlen_fwd` was called separately with matching dtype/causal/lse. Fixed
+  upstream by PRs #275 (bootstrap the varlen `.so` on the flat-gather path) and
+  #276 (probe for native paging rather than trusting the AITER version), which
+  together make `backend=auto` resolve to AITER and run unaided at page sizes 1
+  through 256. Page size 1024 still fails a `dlsym` lookup.
 
 ### Correctness: three-way agreement
 
@@ -161,12 +165,17 @@ prefill headroom inside SGLang.
 
 ### Open decisions
 
-- **Push target.** `origin` is `sgl-project/sglang` itself, so pushing publishes
-  a branch on the official repo rather than backing anything up.
-- **The `amd.1` disclosure.** The published wheel's causal-prefill bug is
-  documented in `benchmark/flashinfer_rocm/README.md`, `plans/`, and the error
-  message in `docker/rocm-flashinfer-smoke.py`. Accurate and verified, but no
-  fixed wheel is on the index yet.
+- ~~**Push target.**~~ Resolved: `origin` now points at the `demandal25/sglang`
+  fork, and the branch is pushed there.
+- ~~**The `amd.1` disclosure.**~~ Resolved: the shipping files (smoke test,
+  kernel tests, benchmark README) describe the *failure mode* without naming a
+  version, so they keep their diagnostic value without asserting a defect in a
+  published AMD artifact. `HANDOFF-head-dim-192.md` — which carried the measured
+  error table — was removed. This plan is the remaining record; it is working
+  notes rather than something SGLang ships. Re-verified 2026-08-13:
+  `0.5.3+amd.1` is still the only wheel on `pypi.amd.com`, so the underlying
+  issue is live and the real remedy is publishing `amd.2` (fix `a7a2f0b6`),
+  not documenting it here.
 - **Upstream PR or internal branch?** Changes what else is needed.
 
 ### Model access notes
@@ -489,7 +498,7 @@ Done:
   the scheduler's `seq_lens_cpu`. Measured 0.190 → 0.146 ms/step of metadata,
   output unchanged.
 
-Handed off to AMD-Ecosystem/flashinfer (`HANDOFF-head-dim-192.md`):
+Handed off to AMD-Ecosystem/flashinfer:
 
 - **Decode kernel**, ~0.39 ms/step of the 0.50 ms gap. `fa2` decode `run()` is
   0.0405 ms/call; AITER would need ~1.78× per call to close it.

@@ -3,13 +3,12 @@
 Usage:
 python3 -m unittest test_flashinfer_rocm_attention_kernels.TestFlashInferRocmKernels
 
-Regression guard. The published amd-flashinfer 0.5.3+amd.1 wheel returns wrong
-values from *causal* paged prefill on gfx942 while decode and non-causal prefill
-are exact, and while the output stays right-shaped and finite. It was fixed in
-0.5.3+amd.2 ("MFMA C/D row indexing for custom masks with GQA"). An import or
-shape check does not catch that class of failure, so compare against a torch
-SDPA reference and pin the (k, v) tuple layout that flashinfer_rocm_backend
-hands the wrappers at the same time.
+Regression guard against a failure this backend has actually hit: *causal*
+paged prefill returning wrong values on gfx942 while decode and non-causal
+prefill stay exact, with the output right-shaped and finite throughout. An
+import or shape check does not catch that class of failure, so compare against
+a torch SDPA reference and pin the (k, v) tuple layout that
+flashinfer_rocm_backend hands the wrappers at the same time.
 """
 
 import unittest
@@ -25,7 +24,7 @@ register_amd_ci(est_time=120, suite="stage-b-test-1-gpu-small-amd")
 
 _WORKSPACE_BYTES = 128 * 1024 * 1024
 # bf16 attention against an fp32 SDPA reference; the observed error is ~1e-3,
-# while the amd.1 regression produced 2.4-4.1.
+# while the miscompute this guards against produced 2.4-4.1.
 _TOLERANCE = 0.02
 
 
@@ -108,7 +107,7 @@ class TestFlashInferRocmKernels(CustomTestCase):
         return (actual - _sdpa_reference(q, k, v, causal=causal)).abs().max().item()
 
     def test_causal_paged_prefill_matches_sdpa(self):
-        """The amd.1 regression: some output rows exact, others badly wrong."""
+        """The bad case: some output rows exact, others badly wrong."""
         for num_qo_heads, num_kv_heads in ((4, 4), (32, 8)):
             with self.subTest(num_qo_heads=num_qo_heads, num_kv_heads=num_kv_heads):
                 error = self._run_prefill(
@@ -117,7 +116,7 @@ class TestFlashInferRocmKernels(CustomTestCase):
                 self.assertLess(error, _TOLERANCE, f"max abs error {error:.4f}")
 
     def test_non_causal_paged_prefill_matches_sdpa(self):
-        """Stays exact across the amd.1 regression — isolates it to masking.
+        """Stays exact when the causal path breaks — isolates it to masking.
 
         Without this, a future causal-only failure looks like a generic layout
         or scaling bug and sends the next person down the wrong path.
